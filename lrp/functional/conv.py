@@ -12,13 +12,51 @@ def _forward_rho(
     ctx.save_for_backward(input, weight, bias)
     ctx.rho = rho
     ctx.incr = incr
-    ctx.stride = stride
-    ctx.padding = padding
-    ctx.dilation = dilation
+    # Ensure stride and padding are tuples
+    ctx.stride = stride if isinstance(stride, tuple) else (stride, stride)
+    ctx.padding = padding if isinstance(padding, tuple) else (padding, padding)
+    ctx.dilation = dilation if isinstance(dilation, tuple) else (dilation, dilation)
     ctx.groups = groups
+    ctx.input_size = input.size()
 
     Z = F.conv2d(input, weight, bias, stride, padding, dilation, groups)
     return Z
+
+
+def _calculate_output_padding(
+    input_size, output_size, kernel_size, stride, padding, dilation
+):
+    """Helper function to calculate output padding safely"""
+
+    # Ensure all inputs are pairs of integers
+    def to_pair(x):
+        return x if isinstance(x, tuple) else (x, x)
+
+    stride = to_pair(stride)
+    padding = to_pair(padding)
+    dilation = to_pair(dilation)
+
+    h_out_pad = max(
+        0,
+        input_size[2]
+        - (
+            (output_size[2] - 1) * stride[0]
+            - 2 * padding[0]
+            + dilation[0] * (kernel_size[2] - 1)
+            + 1
+        ),
+    )
+    w_out_pad = max(
+        0,
+        input_size[3]
+        - (
+            (output_size[3] - 1) * stride[1]
+            - 2 * padding[1]
+            + dilation[1] * (kernel_size[3] - 1)
+            + 1
+        ),
+    )
+    return (h_out_pad, w_out_pad)
 
 
 def _backward_rho(ctx, relevance_output):
@@ -30,7 +68,21 @@ def _backward_rho(ctx, relevance_output):
     )
 
     relevance_output = relevance_output / Z
-    relevance_input = F.conv_transpose2d(relevance_output, weight, None, padding=1)
+
+    output_padding = _calculate_output_padding(
+        ctx.input_size, Z.size(), weight.size(), ctx.stride, ctx.padding, ctx.dilation
+    )
+
+    relevance_input = F.conv_transpose2d(
+        relevance_output,
+        weight,
+        None,
+        stride=ctx.stride,
+        padding=ctx.padding,
+        output_padding=output_padding,
+        dilation=ctx.dilation,
+        groups=ctx.groups,
+    )
     relevance_input = relevance_input * input
 
     trace.do_trace(relevance_input)
@@ -143,6 +195,12 @@ def _conv_alpha_beta_forward(
 ):
     Z = F.conv2d(input, weight, bias, stride, padding, dilation, groups)
     ctx.save_for_backward(input, weight, Z, bias)
+    # Save additional context and ensure values are tuples
+    ctx.stride = stride if isinstance(stride, tuple) else (stride, stride)
+    ctx.padding = padding if isinstance(padding, tuple) else (padding, padding)
+    ctx.dilation = dilation if isinstance(dilation, tuple) else (dilation, dilation)
+    ctx.groups = groups
+    ctx.input_size = input.size()
     return Z
 
 
@@ -158,15 +216,52 @@ def _conv_alpha_beta_backward(alpha, beta, ctx, relevance_output):
     input_neg = torch.where(input <= 0, input, torch.zeros_like(input))
 
     def f(X1, X2, W1, W2):
-
-        Z1 = F.conv2d(X1, W1, bias=None, stride=1, padding=1)
-        Z2 = F.conv2d(X2, W2, bias=None, stride=1, padding=1)
+        Z1 = F.conv2d(
+            X1,
+            W1,
+            bias=None,
+            stride=ctx.stride,
+            padding=ctx.padding,
+            dilation=ctx.dilation,
+            groups=ctx.groups,
+        )
+        Z2 = F.conv2d(
+            X2,
+            W2,
+            bias=None,
+            stride=ctx.stride,
+            padding=ctx.padding,
+            dilation=ctx.dilation,
+            groups=ctx.groups,
+        )
         Z = Z1 + Z2
 
         rel_out = relevance_output / (Z + (Z == 0).float() * 1e-6)
 
-        t1 = F.conv_transpose2d(rel_out, W1, bias=None, padding=1)
-        t2 = F.conv_transpose2d(rel_out, W2, bias=None, padding=1)
+        output_padding = _calculate_output_padding(
+            ctx.input_size, Z.size(), W1.size(), ctx.stride, ctx.padding, ctx.dilation
+        )
+
+        t1 = F.conv_transpose2d(
+            rel_out,
+            W1,
+            bias=None,
+            stride=ctx.stride,
+            padding=ctx.padding,
+            output_padding=output_padding,
+            dilation=ctx.dilation,
+            groups=ctx.groups,
+        )
+        t2 = F.conv_transpose2d(
+            rel_out,
+            W2,
+            bias=None,
+            stride=ctx.stride,
+            padding=ctx.padding,
+            output_padding=output_padding,
+            dilation=ctx.dilation,
+            groups=ctx.groups,
+        )
 
         r1 = t1 * X1
         r2 = t2 * X2
@@ -231,8 +326,11 @@ def _pattern_forward(
     Z = F.conv2d(input, weight, bias, stride, padding, dilation, groups)
     ctx.save_for_backward(input, weight, pattern)
 
-    ctx.stride = stride
-    ctx.padding = padding
+    ctx.stride = stride if isinstance(stride, tuple) else (stride, stride)
+    ctx.padding = padding if isinstance(padding, tuple) else (padding, padding)
+    ctx.dilation = dilation if isinstance(dilation, tuple) else (dilation, dilation)
+    ctx.groups = groups
+    ctx.input_size = input.size()
     ctx.attribution = attribution
     return Z
 
@@ -242,8 +340,24 @@ def _pattern_backward(ctx, relevance_output):
 
     if ctx.attribution:
         P = P * weight  # PatternAttribution
+
+    output_padding = _calculate_output_padding(
+        ctx.input_size,
+        relevance_output.size(),
+        P.size(),
+        ctx.stride,
+        ctx.padding,
+        ctx.dilation,
+    )
+
     relevance_input = F.conv_transpose2d(
-        relevance_output, P, padding=ctx.padding, stride=ctx.stride
+        relevance_output,
+        P,
+        stride=ctx.stride,
+        padding=ctx.padding,
+        output_padding=output_padding,
+        dilation=ctx.dilation,
+        groups=ctx.groups,
     )
 
     trace.do_trace(relevance_input)
